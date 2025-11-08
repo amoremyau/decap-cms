@@ -1,28 +1,53 @@
 name: Security Summary
 
 on:
+  # для тестовых запусков прямо в PR
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  # для «боевого» запуска уже ПОСЛЕ Security Gateway (когда файл будет в main)
   workflow_run:
     workflows: ["Security Gateway"]
     types: [completed]
 
+  # ручной запуск из Actions
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: write   # обязательно: пишем комментарий в PR
+
+# один прогон на коммит (и в PR, и после gateway)
+concurrency:
+  group: security-summary-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   summarize:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Если вызвали через workflow_run — требуем успех Gateway.
+    # Если через pull_request/dispatch — запускаем без этого условия.
+    if: >
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      || (github.event_name != 'workflow_run')
+
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-      pull-requests: write
-      actions: read
     steps:
-      - name: Build markdown summary & publish
+      - name: Build summary table & comment to PR
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-            const sha   = context.payload.workflow_run.head_sha;
 
+            // SHA коммита: из workflow_run или из PR
+            const sha =
+              context.eventName === 'workflow_run'
+                ? context.payload.workflow_run.head_sha
+                : (context.payload.pull_request?.head?.sha || context.sha);
+
+            // Список проверок, которые хотим свести
             const required = [
               "SAST - CodeQL",
               "SAST - Semgrep",
@@ -32,56 +57,41 @@ jobs:
               "DAST - OWASP ZAP Baseline",
               "Lint - GitHub Actions",
               "CI - Build & Test",
-              "Node CI"
+              "Security Gateway"
             ];
 
-            // Забираем завершенные рансы для этого коммита
+            // Берём последние прогоны именно по этому коммиту
             const { data } = await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 100, head_sha: sha, status: 'completed'
+              owner, repo, per_page: 100, head_sha: sha
             });
 
             const latest = {};
             for (const r of data.workflow_runs) {
               if (!required.includes(r.name)) continue;
-              if (!latest[r.name]) latest[r.name] = r.conclusion;
+              if (!latest[r.name]) latest[r.name] = r.conclusion; // первый — самый свежий
             }
 
-            function badge(c) {
-              return c === 'success' ? '✅' :
-                     c === 'failure' ? '❌' :
-                     c === 'cancelled' ? '⏹️' : '⚠️';
+            const rows = required
+              .map(n => `| ${n} | ${latest[n] ?? "—"} |`)
+              .join("\n");
+
+            const body = [
+              "### Security Summary",
+              "",
+              "| Проверка | Статус |",
+              "|---|---|",
+              rows
+            ].join("\n");
+
+            // Ищем номер PR: из pull_request или из workflow_run
+            const prNumber =
+              context.eventName === 'pull_request'
+                ? context.payload.number
+                : (context.payload.workflow_run?.pull_requests?.[0]?.number);
+
+            if (prNumber) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+            } else {
+              core.notice("PR not found for this run; printed to logs only.");
+              console.log(body);
             }
-
-            let ok = true;
-            const lines = required.map(n => {
-              const c = latest[n] || 'missing';
-              if (c !== 'success') ok = false;
-              return `- ${badge(c)} **${n}** — \`${c}\``;
-            });
-
-            const md = [
-              `### Security Summary for \`${sha.slice(0,7)}\``,
-              '',
-              ...lines,
-              '',
-              ok ? '**Overall:** ✅ All required checks passed.' :
-                   '**Overall:** ❌ Some checks failed or missing.'
-            ].join('\n');
-
-            // Комментарий в PR (если есть связанный PR)
-            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
-            if (prs.data.length) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: prs.data[0].number, body: md
-              });
-            }
-
-            // Check Run «Security Summary»
-            await github.rest.checks.create({
-              owner, repo,
-              name: 'Security Summary',
-              head_sha: sha,
-              status: 'completed',
-              conclusion: ok ? 'success' : 'failure',
-              output: { title: 'Security Summary', summary: md }
-            });
