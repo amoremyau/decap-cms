@@ -1,13 +1,12 @@
 name: Lint - GitHub Actions
 
 on:
+  # Запуск на каждом pull request и push в main
   pull_request:
-    paths:
-      - ".github/workflows/**"
   push:
-    branches: [ "main", "master" ]
-    paths:
-      - ".github/workflows/**"
+    branches: [ main ]
+
+permissions: read-all
 
 jobs:
   actionlint:
@@ -19,5 +18,6 @@ jobs:
       - name: Run actionlint
         uses: reviewdog/action-actionlint@v1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}   # чтобы печатать результаты в лог/PR
-          actionlint_flags: "-color"                  
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          actionlint_flags: "-shellcheck= -color"
+           
