@@ -24,6 +24,8 @@ jobs:
         with:
           name: build-output
           path: ./build-output
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
 
       # 2) Копируем файлы на VPS
       - name: Copy files to VPS via SCP
