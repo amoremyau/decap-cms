@@ -58,7 +58,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          path: dev-test/dist
+          path: dev-test
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22.x' && failure()
