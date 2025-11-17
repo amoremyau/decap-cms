@@ -18,14 +18,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Забираем артефакт сборки из build.yml
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
+      # 1) Загружаем артефакт из Node CI
+      - name: Download build artifact from Node CI
+        uses: dawidd6/action-download-artifact@v2
         with:
+          workflow: nodejs.yml
           name: build-output
           path: ./build-output
+          workflow_conclusion: success
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
+          
 
       # 2) Копируем файлы на VPS
       - name: Copy files to VPS via SCP
