@@ -4,3 +4,5 @@ cypress/**
 **/*.test.*
 **/__snapshots__/**
 functions/**   
+dist/
+public/
