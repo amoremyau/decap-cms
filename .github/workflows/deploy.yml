@@ -1,0 +1,49 @@
+name: Deploy to VPS
+
+on:
+  # деплой только если Security Gateway прошёл успешно
+  workflow_run:
+    workflows:
+      - "Security Gateway"
+    types:
+      - completed
+
+concurrency:
+  group: deploy-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Забираем артефакт сборки из build.yml
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: ./build-output
+
+      # 2) Копируем файлы на VPS
+      - name: Copy files to VPS via SCP
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}       # 176.124.213.11
+          username: ${{ secrets.VPS_USER }}   # root
+          key: ${{ secrets.VPS_SSH_KEY }}     # приватный ключ
+          port: 22
+          source: "./build-output/*"
+          target: "/var/www/decap-cms"
+          overwrite: true
+
+      # 3) Перезапускаем веб-сервер на VPS (если настроен nginx)
+      - name: Restart web server on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            systemctl reload nginx || systemctl restart nginx || true

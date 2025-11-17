@@ -3,8 +3,9 @@ name: Security Gateway
 on:
   workflow_run:
     workflows:
-      - "Node CI"                     # якорь
-    types: [completed]
+      - "Node CI"        # якорь: основной CI workflow
+    types:
+      - completed
 
 concurrency:
   group: security-gateway-${{ github.event.workflow_run.head_sha }}
@@ -14,22 +15,28 @@ permissions:
   actions: read
   contents: read
   checks: read
+  security-events: read
   pull-requests: write
 
 jobs:
   gate:
+    # запускаемся только если Node CI завершился успешно
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.name == 'Node CI' }}
     runs-on: ubuntu-latest
+
     steps:
-      - name: Wait & evaluate all checks for this commit
+      - name: Wait & evaluate all checks + vulnerabilities
         uses: actions/github-script@v7
         with:
           script: |
+            const core = require('@actions/core');
+
             const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const sha   = context.payload.workflow_run.head_sha;
+            const repo = context.repo.repo;
+            const sha = context.payload.workflow_run.head_sha;
             const runId = context.payload.workflow_run.id;
 
+            // Workflow, которые должны быть завершены
             const required = [
               "SAST - CodeQL",
               "SAST - Semgrep",
@@ -42,34 +49,49 @@ jobs:
               "Node CI"
             ];
 
-            // 1) ГАРАНТИЯ: реагируем только на САМЫЙ СВЕЖИЙ Node CI по этому SHA
+            // 1) Гарантия: реагируем только на САМЫЙ СВЕЖИЙ Node CI по этому SHA
             const { data: allRuns } = await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 100, head_sha: sha, status: 'completed'
+              owner,
+              repo,
+              per_page: 100,
+              head_sha: sha,
+              status: 'completed',
             });
+
             const nodeCiRuns = allRuns.workflow_runs.filter(r => r.name === 'Node CI');
             if (!nodeCiRuns.length) {
-              core.setFailed('No Node CI runs found for this commit');
+              core.setFailed('Security gateway: no "Node CI" runs found for this commit');
               return;
             }
-            const latestNodeCi = nodeCiRuns[0]; // API возвращает уже отсортированным по дате
+
+            // первый в списке — самый свежий
+            const latestNodeCi = nodeCiRuns[0];
+
             if (latestNodeCi.id !== runId) {
-              core.notice(`Skip: this event is not the latest Node CI (event=${runId}, latest=${latestNodeCi.id}).`);
-              return; // выходим тихо, ждём событие от самого свежего прогона
+              core.notice(`Security gateway: skip run ${runId}, waiting for latest Node CI run ${latestNodeCi.id}`);
+              return; // тихо выходим, ждём событие от самого свежего прогона
             }
 
-            // 2) ЖДЕМ, пока ВСЕ required перейдут в completed для этого SHA
-            const timeoutMs  = 15 * 60 * 1000;
+            // 2) Ждём пока ВСЕ required workflow завершатся
+            const timeoutMs = 15 * 60 * 1000;
             const intervalMs = 20 * 1000;
-            const deadline   = Date.now() + timeoutMs;
+            const deadline = Date.now() + timeoutMs;
 
             async function getLatestCompletedMap() {
               const { data } = await github.rest.actions.listWorkflowRunsForRepo({
-                owner, repo, per_page: 100, head_sha: sha, status: 'completed'
+                owner,
+                repo,
+                per_page: 100,
+                head_sha: sha,
+                status: 'completed',
               });
+
               const map = {};
               for (const r of data.workflow_runs) {
                 if (!required.includes(r.name)) continue;
-                if (!map[r.name]) map[r.name] = r.conclusion; // самый свежий
+                if (!map[r.name]) {
+                  map[r.name] = r.conclusion;
+                }
               }
               return map;
             }
@@ -77,22 +99,90 @@ jobs:
             while (true) {
               const latest = await getLatestCompletedMap();
               const missing = required.filter(n => latest[n] === undefined);
+
               if (missing.length === 0) {
-                // 3) ОЦЕНКА
+                // Проверяем, не упал ли какой-то workflow технически
                 const failed = Object.entries(latest)
-                                     .filter(([_, c]) => c !== 'success')
-                                     .map(([n, c]) => `${n}=${c}`);
+                  .filter(([_, c]) => c !== 'success')
+                  .map(([n, c]) => `${n}=${c}`);
+
                 if (failed.length) {
-                  core.setFailed(`Failed checks: ${failed.join(', ')}`);
-                } else {
-                  core.info(`Security gate passed ✅ for ${sha.substring(0,7)}`);
+                  core.setFailed(`Security gateway: some checks failed technically: ${failed.join(', ')}`);
+                  return;
                 }
-                return;
+
+                core.info('All required workflows finished successfully. Evaluating vulnerabilities…');
+                break;
               }
+
               if (Date.now() > deadline) {
-                core.setFailed(`Timeout waiting for: ${missing.join(', ')}`);
+                core.setFailed(`Security gateway: timeout while waiting for workflows: ${missing.join(', ')}`);
                 return;
               }
-              core.info(`Waiting for: ${missing.join(', ')} ...`);
+
+              core.info(`Security gateway: waiting for workflows: ${missing.join(', ')} …`);
               await new Promise(r => setTimeout(r, intervalMs));
             }
+
+            // 3) Читаем алерты из GitHub Code Scanning по этому коммиту
+            const alerts = await github.paginate(
+              github.rest.codeScanning.listAlertsForRepo,
+              {
+                owner,
+                repo,
+                ref: sha,       // привязываемся к конкретному коммиту
+                per_page: 100,
+                state: 'open',
+              }
+            );
+
+            const counts = {
+              critical: 0,
+              high: 0,
+              medium: 0,
+              low: 0,
+              other: 0,
+            };
+
+            for (const a of alerts) {
+              const lvl = (a.rule?.security_severity_level || '').toLowerCase();
+              if (lvl === 'critical') counts.critical++;
+              else if (lvl === 'high') counts.high++;
+              else if (lvl === 'medium') counts.medium++;
+              else if (lvl === 'low') counts.low++;
+              else counts.other++;
+            }
+
+            core.info(
+              `Security gateway: alerts for ${sha.substring(0,7)} → ` +
+              `critical=${counts.critical}, high=${counts.high}, medium=${counts.medium}, low=${counts.low}, other=${counts.other}`
+            );
+
+            // Покажем первые 20 уязвимостей в логах
+            const sample = alerts.slice(0, 20).map(a => {
+              const lvl = a.rule?.security_severity_level || a.rule?.severity || 'unknown';
+              const ruleId = a.rule?.id || 'rule';
+              const path = a.most_recent_instance?.location?.path || '?';
+              const line = a.most_recent_instance?.location?.startLine || 0;
+              return `- [${lvl}] ${ruleId} @ ${path}:${line}`;
+            });
+
+            if (sample.length) {
+              core.info('Sample of found vulnerabilities:\n' + sample.join('\n'));
+            } else {
+              core.info('No code scanning alerts found for this commit.');
+            }
+
+            // 4) Политика блокировки:
+            //    2 и более Critical → роняем пайплайн
+            const criticalThreshold = 2;
+
+            if (counts.critical >= criticalThreshold) {
+              core.setFailed(
+                `Security gateway: found ${counts.critical} critical alerts (threshold = ${criticalThreshold}), blocking deployment.`
+              );
+              return;
+            }
+
+            core.info('Security gateway PASSED ✅ — критических уязвимостей меньше порога.');
+

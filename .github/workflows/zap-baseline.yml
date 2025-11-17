@@ -12,38 +12,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) Запускаем ZAP; если внутренний upload упадет — НЕ роняем job
-      - name: ZAP Baseline scan (demo target, do not fail)
+      # 1) Запускаем ZAP; результат сам по себе job не роняет —
+      # решение принимает Security Gateway
+      - name: ZAP Baseline scan (non-blocking)
         id: zap
         uses: zaproxy/action-baseline@v0.11.0
-        continue-on-error: true              # ← ключ: не проваливать job из-за артефакта
+        continue-on-error: true
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # на всякий случай
-          target: "https://example.com"
-          fail_action: false                 # находки (WARN/INFO) не роняют job
-          cmd_options: "-a -m 0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # URL приложения на VPS. ZAP_TARGET_URL = http://176.124.213.11
+          target: ${{ secrets.ZAP_TARGET_URL }}
+          fail_action: false         # уязвимости не ломают job
+          cmd_options: >
+            -a                       # автоматический режим
+            -m 0                     # не падать по уровням риска
+            -J zap_report.json       # JSON-отчёт (удобно разбирать)
           allow_issue_writing: false
-          artifact_name: zapreport           # простое имя; всё равно держим «на всякий»
+          artifact_name: zap_report
 
-      # 2) Покажем, что именно создал ZAP
-      - name: List reports
-        if: always()
-        run: |
-          echo "::group::ZAP output"
-          ls -la
-          echo "--- try to find likely reports ---"
-          find . -maxdepth 3 -type f \( -iname "*zap*.html" -o -iname "*report*.html" -o -iname "*.json" -o -name "zap.out" \)
-          echo "::endgroup::"
-
-      # 3) Забираем отчёты вручную — стабильный способ
-      - name: Upload ZAP artifacts (fallback)
+      # 2) Всегда прикладываем артефакты с отчётом
+      - name: Upload ZAP artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap_report_${{ github.run_id }}
           path: |
+            zap_report.json
             zap.out
             **/*zap*.html
             **/*report*.html
-            **/*.json
           if-no-files-found: warn
